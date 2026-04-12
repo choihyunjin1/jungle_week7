@@ -381,6 +381,7 @@ int main(int argc, char **argv)
 			   p1 * 100,
 			   p2 * 100,
 			   perfindex);
+		printf("DEBUG: avg_util=%.6f perf=%.4f\n", avg_mm_util, perfindex);
 	}
 	else
 	{ /* There were errors */
@@ -989,6 +990,7 @@ static void printresults(int n, stats_t *stats)
 				   stats[i].ops,
 				   stats[i].secs,
 				   (stats[i].ops / 1e3) / stats[i].secs);
+			printf("   T%d=%.6f\n", i, stats[i].util);
 			secs += stats[i].secs;
 			ops += stats[i].ops;
 			util += stats[i].util;
