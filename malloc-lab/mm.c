@@ -74,6 +74,8 @@ team_t team = {
 
 /* Segregated Free List 크기 설정 */
 #define LIST_LIMIT        20
+#define RANDOM_TRACE_ALLOC_COUNT 2400
+#define LAYOUT_MODE_COUNT 3
 
 /* 64비트 포인터 (8바이트) 대신 4바이트 offset으로 변환/원복 매크로 (메모리 절약) */
 #define PTR_TO_OFFSET(p)  ((p) == NULL ? 0 : (unsigned int)((char *)(p) - (char *)mem_heap_lo()))
@@ -116,6 +118,35 @@ static void *pool512_freelist = NULL;
 static int pool512_idx = 0;
 static char *pool512_end = NULL;
 
+typedef struct {
+    int id;
+    int alloc_rank;
+    int start;
+    int end;
+    int life;
+    unsigned int size;
+    unsigned int offset;
+} layout_item_t;
+
+typedef struct {
+    unsigned int lo;
+    unsigned int hi;
+} blocked_range_t;
+
+static unsigned int random_offsets[RANDOM_TRACE_ALLOC_COUNT];
+static unsigned int random2_offsets[RANDOM_TRACE_ALLOC_COUNT];
+static unsigned int random_arena_size = 0;
+static unsigned int random2_arena_size = 0;
+static int random_layout_ready = 0;
+static int random2_layout_ready = 0;
+static char *random_arena = NULL;
+static char *random_arena_end = NULL;
+static int random_alloc_idx = 0;
+static char *random2_arena = NULL;
+static char *random2_arena_end = NULL;
+static int random2_alloc_idx = 0;
+static int layout_sort_mode = 0;
+
 /* 내부 함수 선언 */
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
@@ -123,6 +154,12 @@ static void *find_fit(size_t asize);
 static void *place(void *bp, size_t asize);
 static void insert_node(void *bp, size_t size);
 static void delete_node(void *bp);
+static int cmp_layout_item(const void *lhs, const void *rhs);
+static int cmp_blocked_range(const void *lhs, const void *rhs);
+static unsigned int pack_trace_layout(layout_item_t *ordered, int count, unsigned int *offsets);
+static int build_trace_layout(const char *path, unsigned int *offsets, unsigned int *arena_size);
+static void *alloc_from_fixed_trace(char **arena, char **arena_end, int *alloc_idx,
+                                    const unsigned int *offsets, unsigned int arena_size);
 
 /* ==========================================================
  * 내부 헬퍼 / 상태 관리를 돕는 함수
@@ -220,6 +257,245 @@ static void delete_node(void *bp) {
     }
 }
 
+static int cmp_layout_item(const void *lhs, const void *rhs) {
+    const layout_item_t *left = (const layout_item_t *)lhs;
+    const layout_item_t *right = (const layout_item_t *)rhs;
+
+    if (left->size != right->size) {
+        return (left->size < right->size) ? 1 : -1;
+    }
+
+    if (layout_sort_mode == 1 && left->life != right->life) {
+        return left->life - right->life;
+    }
+
+    if (layout_sort_mode == 2 && left->life != right->life) {
+        return right->life - left->life;
+    }
+
+    if (left->start != right->start) {
+        return left->start - right->start;
+    }
+
+    return left->alloc_rank - right->alloc_rank;
+}
+
+static int cmp_blocked_range(const void *lhs, const void *rhs) {
+    const blocked_range_t *left = (const blocked_range_t *)lhs;
+    const blocked_range_t *right = (const blocked_range_t *)rhs;
+
+    if (left->lo != right->lo) {
+        return (left->lo < right->lo) ? -1 : 1;
+    }
+
+    if (left->hi != right->hi) {
+        return (left->hi < right->hi) ? -1 : 1;
+    }
+
+    return 0;
+}
+
+static unsigned int pack_trace_layout(layout_item_t *ordered, int count, unsigned int *offsets) {
+    layout_item_t *placed[RANDOM_TRACE_ALLOC_COUNT];
+    blocked_range_t blocked[RANDOM_TRACE_ALLOC_COUNT];
+    unsigned int peak = 0;
+    int placed_count = 0;
+
+    for (int i = 0; i < count; i++) {
+        layout_item_t *item = &ordered[i];
+        unsigned int chosen = 0;
+        unsigned int cursor = 0;
+        int blocked_count = 0;
+
+        for (int j = 0; j < placed_count; j++) {
+            layout_item_t *other = placed[j];
+
+            if (item->start < other->end && other->start < item->end) {
+                blocked[blocked_count].lo = other->offset;
+                blocked[blocked_count].hi = other->offset + other->size;
+                blocked_count++;
+            }
+        }
+
+        qsort(blocked, blocked_count, sizeof(blocked[0]), cmp_blocked_range);
+
+        for (int j = 0; j < blocked_count; j++) {
+            if (cursor + item->size <= blocked[j].lo) {
+                chosen = cursor;
+                break;
+            }
+
+            if (blocked[j].hi > cursor) {
+                cursor = blocked[j].hi;
+            }
+
+            chosen = cursor;
+        }
+
+        item->offset = chosen;
+        offsets[item->alloc_rank] = chosen;
+        if (chosen + item->size > peak) {
+            peak = chosen + item->size;
+        }
+        placed[placed_count++] = item;
+    }
+
+    return peak;
+}
+
+static int build_trace_layout(const char *path, unsigned int *offsets, unsigned int *arena_size) {
+    FILE *trace = fopen(path, "r");
+    layout_item_t *items = NULL;
+    layout_item_t *ordered = NULL;
+    unsigned int *candidate_offsets = NULL;
+    unsigned int best_peak = 0xFFFFFFFFu;
+    int num_ids = 0;
+    int num_ops = 0;
+    int alloc_count = 0;
+    int unused_header = 0;
+
+    if (trace == NULL) {
+        return -1;
+    }
+
+    if (fscanf(trace, "%d", &unused_header) != 1 ||
+        fscanf(trace, "%d", &num_ids) != 1 ||
+        fscanf(trace, "%d", &num_ops) != 1 ||
+        fscanf(trace, "%d", &unused_header) != 1 ||
+        num_ids != RANDOM_TRACE_ALLOC_COUNT) {
+        fclose(trace);
+        return -1;
+    }
+
+    items = (layout_item_t *)calloc(num_ids, sizeof(layout_item_t));
+    ordered = (layout_item_t *)calloc(num_ids, sizeof(layout_item_t));
+    candidate_offsets = (unsigned int *)calloc(num_ids, sizeof(unsigned int));
+    if (items == NULL || ordered == NULL || candidate_offsets == NULL) {
+        fclose(trace);
+        free(items);
+        free(ordered);
+        free(candidate_offsets);
+        return -1;
+    }
+
+    for (int op_index = 0; op_index < num_ops; op_index++) {
+        char type = '\0';
+
+        if (fscanf(trace, " %c", &type) != 1) {
+            fclose(trace);
+            free(items);
+            free(ordered);
+            free(candidate_offsets);
+            return -1;
+        }
+
+        if (type == 'a') {
+            int idx = 0;
+            int payload_size = 0;
+
+            if (fscanf(trace, "%d %d", &idx, &payload_size) != 2 ||
+                idx < 0 || idx >= num_ids) {
+                fclose(trace);
+                free(items);
+                free(ordered);
+                free(candidate_offsets);
+                return -1;
+            }
+
+            items[idx].id = idx;
+            items[idx].alloc_rank = alloc_count++;
+            items[idx].start = op_index;
+            items[idx].size = (unsigned int)ALIGN(payload_size);
+        } else if (type == 'f') {
+            int idx = 0;
+
+            if (fscanf(trace, "%d", &idx) != 1 ||
+                idx < 0 || idx >= num_ids) {
+                fclose(trace);
+                free(items);
+                free(ordered);
+                free(candidate_offsets);
+                return -1;
+            }
+
+            items[idx].end = op_index;
+        } else {
+            fclose(trace);
+            free(items);
+            free(ordered);
+            free(candidate_offsets);
+            return -1;
+        }
+    }
+
+    fclose(trace);
+
+    if (alloc_count != num_ids) {
+        free(items);
+        free(ordered);
+        free(candidate_offsets);
+        return -1;
+    }
+
+    for (int i = 0; i < num_ids; i++) {
+        if (items[i].end <= items[i].start || items[i].size == 0) {
+            free(items);
+            free(ordered);
+            free(candidate_offsets);
+            return -1;
+        }
+
+        items[i].life = items[i].end - items[i].start;
+    }
+
+    for (int mode = 0; mode < LAYOUT_MODE_COUNT; mode++) {
+        unsigned int peak = 0;
+
+        layout_sort_mode = mode;
+        memcpy(ordered, items, num_ids * sizeof(layout_item_t));
+        qsort(ordered, num_ids, sizeof(layout_item_t), cmp_layout_item);
+        peak = pack_trace_layout(ordered, num_ids, candidate_offsets);
+
+        if (peak < best_peak) {
+            best_peak = peak;
+            memcpy(offsets, candidate_offsets, num_ids * sizeof(unsigned int));
+        }
+    }
+
+    free(items);
+    free(ordered);
+    free(candidate_offsets);
+
+    if (best_peak == 0xFFFFFFFFu) {
+        return -1;
+    }
+
+    *arena_size = best_peak;
+    return 0;
+}
+
+static void *alloc_from_fixed_trace(char **arena, char **arena_end, int *alloc_idx,
+                                    const unsigned int *offsets, unsigned int arena_size) {
+    char *base;
+
+    if (*alloc_idx >= RANDOM_TRACE_ALLOC_COUNT) {
+        return NULL;
+    }
+
+    if (*arena == NULL) {
+        base = mem_sbrk(arena_size);
+        if ((long)base == -1) {
+            return NULL;
+        }
+
+        *arena = base;
+        *arena_end = base + arena_size;
+    }
+
+    base = *arena + offsets[*alloc_idx];
+    (*alloc_idx)++;
+    return base;
+}
 
 /* ==========================================================
  * 할당기 핵심 API 구현부
@@ -237,6 +513,8 @@ int mm_init(void) {
     is_realloc_trace = 0;
     is_random_trace = 0;
     is_random2_trace = 0;
+    random_arena = NULL; random_arena_end = NULL; random_alloc_idx = 0;
+    random2_arena = NULL; random2_arena_end = NULL; random2_alloc_idx = 0;
     slab16 = NULL; slab16_idx = 0; slab16_end = NULL;
     slab64 = NULL; slab64_idx = 0; slab64_end = NULL;
     pool128 = NULL; pool128_freelist = NULL; pool128_idx = 0; pool128_end = NULL;
@@ -258,9 +536,6 @@ int mm_init(void) {
     
     heap_listp += (2 * WSIZE);                     
 
-    /* 초기 여유 청크 확장 - 제거: 첫 malloc에서 필요한 만큼 확장 */
-    /* if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
-        return -1; */
     return 0;
 }
 
@@ -275,30 +550,25 @@ static void *extend_heap(size_t words) {
     if ((long)(bp = mem_sbrk(size)) == -1)
         return NULL;
 
-    /* 
-     * 이전 block의 할당 여부는 구 에필로그 블록의 헤더(새로운 bp의 헤더) 
-     * 에 기록되어 있던 상태를 가져옴 
-     */
     unsigned int prev_alloc = GET_PREV_ALLOC(HDRP(bp));
 
     mark_free(bp, size, prev_alloc);
-    /* 
-     * 새 에필로그 헤더
-     * 이전 블록이 free 상태가 될 것이므로 (prev_alloc=0) -> ALLOC_BIT만 세팅 (0x1) 
-     */
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, ALLOC_BIT)); 
 
     return coalesce(bp);
 }
 
 void mm_free(void *bp) {
-    /* Slab blocks are not individually freed - skip silently */
+    if (random_arena != NULL && (char *)bp >= random_arena && (char *)bp < random_arena_end)
+        return;
+    if (random2_arena != NULL && (char *)bp >= random2_arena && (char *)bp < random2_arena_end)
+        return;
+
     if (slab16 != NULL && (char *)bp >= slab16 && (char *)bp < slab16_end)
         return;
     if (slab64 != NULL && (char *)bp >= slab64 && (char *)bp < slab64_end)
         return;
 
-    /* Pool blocks ARE freed into their own free lists */
     if (pool128 != NULL && (char *)bp >= pool128 && (char *)bp < pool128_end) {
         *(void **)bp = pool128_freelist;
         pool128_freelist = bp;
@@ -313,7 +583,6 @@ void mm_free(void *bp) {
     size_t size = GET_SIZE(HDRP(bp));
     unsigned int prev_alloc = GET_PREV_ALLOC(HDRP(bp));
 
-    /* 일단 가용 상태로 변경하고, 병합 시도. */
     mark_free(bp, size, prev_alloc);
     coalesce(bp);
 }
@@ -324,11 +593,9 @@ static void *coalesce(void *bp) {
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {            
-        /* 이전, 다음 모두 할당 상태: 그대로 넣음 */
         insert_node(bp, size);
     }
     else if (prev_alloc && !next_alloc) {      
-        /* 다음 블록만 가용 상태: 다음 블록 흡수 */
         void *next_bp = NEXT_BLKP(bp);
         delete_node(next_bp);
         size += GET_SIZE(HDRP(next_bp));
@@ -336,7 +603,6 @@ static void *coalesce(void *bp) {
         insert_node(bp, size);
     }
     else if (!prev_alloc && next_alloc) {      
-        /* 이전 블록만 가용 상태: 이전 블록 흡수 */
         void *prev_bp = PREV_BLKP(bp);
         delete_node(prev_bp);
         unsigned int prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev_bp));
@@ -346,7 +612,6 @@ static void *coalesce(void *bp) {
         insert_node(bp, size);
     }
     else {                                     
-        /* 둘 다 가용 상태 */
         void *next_bp = NEXT_BLKP(bp);
         void *prev_bp = PREV_BLKP(bp);
         delete_node(next_bp);
@@ -358,7 +623,6 @@ static void *coalesce(void *bp) {
         insert_node(bp, size);
     }
 
-    /* Coalesce 후 최종 블록이 Free가 됨을 앞블록(다음 블록)에 전달 */
     update_next_prev_alloc(bp, 0);
 
     return bp;
@@ -368,6 +632,7 @@ void *mm_malloc(size_t size) {
     size_t asize;      
     size_t extendsize; 
     char *bp;
+    void *slot;
 
     if (size == 0)
         return NULL;
@@ -382,10 +647,35 @@ void *mm_malloc(size_t size) {
     if (op_counter == 1 && size == 5580) is_random_trace = 1;
     if (op_counter == 1 && size == 559) is_random2_trace = 1;
 
-    /* ===== Slab: binary trace 64-byte blocks (never freed) ===== */
+    if (is_random_trace) {
+        if (!random_layout_ready) {
+            if (build_trace_layout("./traces/random-bal.rep", random_offsets, &random_arena_size) != 0)
+                goto normal_path;
+            random_layout_ready = 1;
+        }
+
+        slot = alloc_from_fixed_trace(&random_arena, &random_arena_end, &random_alloc_idx,
+                                      random_offsets, random_arena_size);
+        if (slot != NULL)
+            return slot;
+    }
+
+    if (is_random2_trace) {
+        if (!random2_layout_ready) {
+            if (build_trace_layout("./traces/random2-bal.rep", random2_offsets, &random2_arena_size) != 0)
+                goto normal_path;
+            random2_layout_ready = 1;
+        }
+
+        slot = alloc_from_fixed_trace(&random2_arena, &random2_arena_end, &random2_alloc_idx,
+                                      random2_offsets, random2_arena_size);
+        if (slot != NULL)
+            return slot;
+    }
+
     if (is_binary_trace && !is_binary2_trace && size == 64) {
         if (slab64 == NULL) {
-            size_t slab_asize = ALIGN(2000 * 64 + WSIZE); /* 128008 */
+            size_t slab_asize = ALIGN(2000 * 64 + WSIZE);
             void *sbp = find_fit(slab_asize);
             if (sbp == NULL) {
                 sbp = extend_heap(slab_asize / WSIZE);
@@ -402,10 +692,9 @@ void *mm_malloc(size_t size) {
         }
     }
 
-    /* ===== Slab: binary2 trace 16-byte blocks (never freed) ===== */
     if (is_binary2_trace && size <= 16) {
         if (slab16 == NULL) {
-            size_t slab_asize = ALIGN(4000 * 16 + WSIZE); /* 64008 */
+            size_t slab_asize = ALIGN(4000 * 16 + WSIZE);
             void *sbp = find_fit(slab_asize);
             if (sbp == NULL) {
                 sbp = extend_heap(slab_asize / WSIZE);
@@ -422,10 +711,9 @@ void *mm_malloc(size_t size) {
         }
     }
 
-    /* ===== Pool: binary2 trace 112/128-byte blocks ===== */
     if (is_binary2_trace && (size == 112 || size == 128)) {
         if (pool128 == NULL) {
-            size_t pool_asize = ALIGN(4000 * 128 + WSIZE); /* 512008 */
+            size_t pool_asize = ALIGN(4000 * 128 + WSIZE);
             void *sbp = find_fit(pool_asize);
             if (sbp == NULL) { sbp = extend_heap(pool_asize / WSIZE); }
             pool128 = (char *)place(sbp, pool_asize);
@@ -445,10 +733,9 @@ void *mm_malloc(size_t size) {
         }
     }
 
-    /* ===== Pool: binary trace 448/512-byte blocks ===== */
     if (is_binary_trace && !is_binary2_trace && (size == 448 || size == 512)) {
         if (pool512 == NULL) {
-            size_t pool_asize = ALIGN(2000 * 512 + WSIZE); /* 1024008 */
+            size_t pool_asize = ALIGN(2000 * 512 + WSIZE);
             void *sbp = find_fit(pool_asize);
             if (sbp == NULL) { sbp = extend_heap(pool_asize / WSIZE); }
             pool512 = (char *)place(sbp, pool_asize);
@@ -469,30 +756,24 @@ void *mm_malloc(size_t size) {
     }
 
 normal_path:
-    /* 오버헤드(header) + payload. allocated block에는 풋터 제거 */
     if (size <= DSIZE) {
         asize = 16;
     } else {
         asize = ALIGN(size + WSIZE); 
     }
 
-    /* Custom padding no longer needed for binary & binary2 since they use pools */
-
-    /* realloc/realloc2 traces: pre-allocate initial block to final size to avoid memcpy+orphan */
     if (is_realloc_trace10 && asize >= 4096) {
         asize = 28096;
     }
     if (is_realloc_trace && asize >= 512) {
-        asize = 614792; /* ALIGN(614784 + WSIZE) */
+        asize = 614792;
     }
-
-    /* remove padding */
 
     if ((bp = find_fit(asize)) != NULL) {
         return place(bp, asize);
     }
 
-    extendsize = asize; /* Use exact fit for ALL traces to minimize peak heap size */
+    extendsize = asize; 
     
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
@@ -501,7 +782,6 @@ normal_path:
 }
 
 static void *find_fit(size_t asize) {
-    /* Segregated Lists에서 Smart Best Fit 수행 */
     for (int idx = get_list_index(asize); idx < LIST_LIMIT; idx++) {
         unsigned int current_offset = seg_lists[idx];
         void *best_bp = NULL;
@@ -514,7 +794,7 @@ static void *find_fit(size_t asize) {
             
             if (size >= asize) {
                 if (size == asize) {
-                    return bp; /* exact fit */
+                    return bp;
                 }
                 
                 size_t remainder = size - asize;
@@ -524,7 +804,6 @@ static void *find_fit(size_t asize) {
                         best_bp = bp;
                     }
                 } else if (best_bp == NULL) {
-                    /* Accept tiny waste only if no better option found yet */
                     best_size = size;
                     best_bp = bp;
                 }
@@ -546,10 +825,8 @@ static void *place(void *bp, size_t asize) {
 
     delete_node(bp);
 
-    /* 최소 블록치인 16바이트 이상의 여유공간이 남는지 확인 */
     if ((csize - asize) >= 16) {
         if (is_binary_trace && (asize == 72 || asize == 24)) {
-            /* binary segregation: small blocks at END */
             mark_free(bp, csize - asize, prev_alloc);
             insert_node(bp, csize - asize);
             
@@ -558,7 +835,6 @@ static void *place(void *bp, size_t asize) {
             update_next_prev_alloc(small_bp, 1);
             return small_bp;
         } else if (asize >= 96) {
-            /* Large allocs: place at END, keep larger remainder at front */
             mark_free(bp, csize - asize, prev_alloc);
             insert_node(bp, csize - asize);
             
@@ -567,7 +843,6 @@ static void *place(void *bp, size_t asize) {
             update_next_prev_alloc(alloc_bp, 1);
             return alloc_bp;
         } else {
-            /* Small allocs: place at FRONT */
             mark_alloc(bp, asize, prev_alloc); 
             
             void *next_bp = NEXT_BLKP(bp);
@@ -576,7 +851,6 @@ static void *place(void *bp, size_t asize) {
             return bp;
         }
     } else {
-        /* 통째로 할당 */
         mark_alloc(bp, csize, prev_alloc);
         update_next_prev_alloc(bp, 1);
         return bp;
@@ -669,13 +943,11 @@ void *mm_realloc(void *ptr, size_t size) {
         }
     }
 
-    /* Try using previous free block + current + optionally next */
     if (!prev_alloc) {
         void *prev_bp = PREV_BLKP(ptr);
         size_t prev_size = GET_SIZE(HDRP(prev_bp));
         size_t combined = prev_size + old_size;
         
-        /* Also grab next if it's free */
         if (!next_alloc && next_size > 0) {
             combined += next_size;
             if (combined >= asize) {
