@@ -70,7 +70,7 @@ team_t team = {
     ""};
 
 /* ========================================================== */
-/* [원래 제공된 코드] 기본 정렬 관롨 상수 및 매크로           */
+/* [원래 제공된 코드] 기본 정렬 관롨 샥수 및 매크로           */
 /* ========================================================== */
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT 8
@@ -89,7 +89,7 @@ team_t team = {
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-/* 크기와 할당 상태 비트를 통합하여 헤더/풋터에 저장할 걒 생성 [1] */
+/* 크기와 할당 상태 비트를 통합하여 헤더/풋터에 저장할 값 생성 [1] */
 #define PACK(size, alloc)  ((size) | (alloc))
 
 /* 주소 p에 있는 워드(4바이트)를 읽거나 씀 [1] */
@@ -247,7 +247,7 @@ static void *extend_heap(size_t words) {
     char *bp;
     size_t size;
 
-    /* 1. 정렬을 은지하기 위해 짝수 개수의 워드를 할당 */
+    /* 1. 정렬을 유지하기 위해 집수 개수의 워드를 할당 */
     size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
     if ((long)(bp = mem_sbrk(size)) == -1)
         return NULL;
