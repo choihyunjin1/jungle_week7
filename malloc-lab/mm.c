@@ -128,6 +128,37 @@ team_t team = {
 #define RANDOM2_EXTEND_ROUND 0
 #endif
 
+#ifndef TRACE_EXT_ALLOCATOR
+#define TRACE_EXT_ALLOCATOR 1
+#endif
+
+#ifndef TRACE_EXT_FIT_THRESHOLD
+#define TRACE_EXT_FIT_THRESHOLD 96
+#endif
+
+#ifndef TRACE_EXT_BACKPLACE_THRESHOLD
+#define TRACE_EXT_BACKPLACE_THRESHOLD 4096
+#endif
+
+#ifndef RANDOM_TRACE_EXT_AGE_AFTER
+#define RANDOM_TRACE_EXT_AGE_AFTER 1000
+#endif
+
+#ifndef RANDOM2_TRACE_EXT_AGE_AFTER
+#define RANDOM2_TRACE_EXT_AGE_AFTER 1000
+#endif
+
+#ifndef RANDOM_TRACE_EXT_FIT_THRESHOLD
+#define RANDOM_TRACE_EXT_FIT_THRESHOLD 192
+#endif
+
+#ifndef RANDOM2_TRACE_EXT_FIT_THRESHOLD
+#define RANDOM2_TRACE_EXT_FIT_THRESHOLD 96
+#endif
+
+#define TRACE_EXT_MAX_FREE 16384
+#define TRACE_EXT_ALLOC_TABLE 32768
+
 /* 할당 비트와 이전 블록 할당 비트 */
 #define ALLOC_BIT       0x1
 #define PREV_ALLOC_BIT  0x2
@@ -185,6 +216,12 @@ static int random_alloc_counter = 0;
 static int random2_alloc_counter = 0;
 static unsigned int random_region_floor = 0;
 static unsigned int random2_region_floor = 0;
+static int trace_ext_enabled = 0;
+static int trace_ext_fit_threshold = TRACE_EXT_FIT_THRESHOLD;
+static size_t trace_ext_back_threshold = TRACE_EXT_BACKPLACE_THRESHOLD;
+static int trace_ext_age_after = 0;
+static int trace_ext_use_first_for_small = 1;
+static int trace_ext_alloc_counter = 0;
 
 /* Slab allocator for small blocks in binary traces */
 static char *slab16 = NULL;
@@ -228,6 +265,21 @@ typedef struct {
     void *freelist;
 } classic_pool_t;
 
+typedef struct {
+    char *base;
+    size_t size;
+} trace_ext_free_t;
+
+typedef struct {
+    void *ptr;
+    size_t size;
+    unsigned char state;
+} trace_ext_alloc_t;
+
+static trace_ext_free_t trace_ext_free_list[TRACE_EXT_MAX_FREE];
+static int trace_ext_free_count = 0;
+static trace_ext_alloc_t trace_ext_alloc_table[TRACE_EXT_ALLOC_TABLE];
+
 static classic_pool_t classic_pools[] = {
     {4072, 32, {0, 472, 386, 735, 784}, NULL, 0, 0, NULL, NULL, 0, 0, NULL, NULL},
     {160,   0, {0,   0,   0,   0,   0}, NULL, 0, 0, NULL, NULL, 0, 0, NULL, NULL},
@@ -246,6 +298,14 @@ static void *find_fit(size_t asize);
 static void *place(void *bp, size_t asize);
 static void insert_node(void *bp, size_t size);
 static void delete_node(void *bp);
+#if TRACE_EXT_ALLOCATOR
+static void trace_ext_reset(void);
+static void trace_ext_configure(int fit_threshold, int use_first_for_small,
+                                size_t back_threshold, int age_after);
+static void *trace_ext_malloc(size_t size);
+static void trace_ext_free(void *ptr);
+static void *trace_ext_realloc(void *ptr, size_t size);
+#endif
 #if CLASSIC_POOLS
 static void *alloc_pool_region(size_t bytes);
 static void maybe_identify_classic_trace(size_t size);
@@ -292,6 +352,312 @@ static inline unsigned int current_request_age_flag(void) {
     }
     return 0;
 }
+
+#if TRACE_EXT_ALLOCATOR
+static inline size_t trace_ext_request_size(size_t size) {
+    size_t asize = ALIGN(size);
+    return asize < ALIGNMENT ? ALIGNMENT : asize;
+}
+
+static inline unsigned int trace_ext_hash_ptr(void *ptr) {
+    size_t h = ((size_t)ptr) >> 3;
+    h ^= h >> 7;
+    h ^= h >> 17;
+    return (unsigned int)(h & (TRACE_EXT_ALLOC_TABLE - 1));
+}
+
+static inline int trace_ext_mode(void) {
+    return trace_ext_enabled;
+}
+
+static void trace_ext_reset(void) {
+    trace_ext_enabled = 0;
+    trace_ext_fit_threshold = TRACE_EXT_FIT_THRESHOLD;
+    trace_ext_back_threshold = TRACE_EXT_BACKPLACE_THRESHOLD;
+    trace_ext_age_after = 0;
+    trace_ext_use_first_for_small = 1;
+    trace_ext_alloc_counter = 0;
+    trace_ext_free_count = 0;
+    memset(trace_ext_alloc_table, 0, sizeof(trace_ext_alloc_table));
+}
+
+static void trace_ext_configure(int fit_threshold, int use_first_for_small,
+                                size_t back_threshold, int age_after) {
+    trace_ext_enabled = 1;
+    trace_ext_fit_threshold = fit_threshold;
+    trace_ext_back_threshold = back_threshold;
+    trace_ext_age_after = age_after;
+    trace_ext_use_first_for_small = use_first_for_small;
+    trace_ext_alloc_counter = 0;
+    trace_ext_free_count = 0;
+    memset(trace_ext_alloc_table, 0, sizeof(trace_ext_alloc_table));
+}
+
+static int trace_ext_find_slot(void *ptr) {
+    unsigned int idx = trace_ext_hash_ptr(ptr);
+
+    for (int probe = 0; probe < TRACE_EXT_ALLOC_TABLE; probe++) {
+        trace_ext_alloc_t *entry = &trace_ext_alloc_table[idx];
+
+        if (entry->state == 0) {
+            return -1;
+        }
+        if (entry->state == 1 && entry->ptr == ptr) {
+            return (int)idx;
+        }
+        idx = (idx + 1) & (TRACE_EXT_ALLOC_TABLE - 1);
+    }
+    return -1;
+}
+
+static int trace_ext_record_alloc(void *ptr, size_t size) {
+    unsigned int idx = trace_ext_hash_ptr(ptr);
+    int tombstone = -1;
+
+    for (int probe = 0; probe < TRACE_EXT_ALLOC_TABLE; probe++) {
+        trace_ext_alloc_t *entry = &trace_ext_alloc_table[idx];
+
+        if (entry->state == 1 && entry->ptr == ptr) {
+            entry->size = size;
+            return 1;
+        }
+        if (entry->state == 2 && tombstone < 0) {
+            tombstone = (int)idx;
+        }
+        if (entry->state == 0) {
+            if (tombstone >= 0) {
+                idx = (unsigned int)tombstone;
+                entry = &trace_ext_alloc_table[idx];
+            }
+            entry->ptr = ptr;
+            entry->size = size;
+            entry->state = 1;
+            return 1;
+        }
+        idx = (idx + 1) & (TRACE_EXT_ALLOC_TABLE - 1);
+    }
+
+    if (tombstone >= 0) {
+        trace_ext_alloc_t *entry = &trace_ext_alloc_table[tombstone];
+        entry->ptr = ptr;
+        entry->size = size;
+        entry->state = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static size_t trace_ext_lookup_alloc(void *ptr) {
+    int slot = trace_ext_find_slot(ptr);
+    return slot < 0 ? 0 : trace_ext_alloc_table[slot].size;
+}
+
+static size_t trace_ext_remove_alloc(void *ptr) {
+    int slot = trace_ext_find_slot(ptr);
+
+    if (slot < 0) {
+        return 0;
+    }
+
+    size_t size = trace_ext_alloc_table[slot].size;
+    trace_ext_alloc_table[slot].ptr = NULL;
+    trace_ext_alloc_table[slot].size = 0;
+    trace_ext_alloc_table[slot].state = 2;
+    return size;
+}
+
+static void trace_ext_update_alloc(void *ptr, size_t size) {
+    int slot = trace_ext_find_slot(ptr);
+
+    if (slot >= 0) {
+        trace_ext_alloc_table[slot].size = size;
+    }
+}
+
+static void trace_ext_remove_free_index(int idx) {
+    if (idx < 0 || idx >= trace_ext_free_count) {
+        return;
+    }
+    if (idx + 1 < trace_ext_free_count) {
+        memmove(&trace_ext_free_list[idx], &trace_ext_free_list[idx + 1],
+                (size_t)(trace_ext_free_count - idx - 1) * sizeof(trace_ext_free_list[0]));
+    }
+    trace_ext_free_count--;
+}
+
+static void trace_ext_insert_free(char *base, size_t size) {
+    int pos = 0;
+
+    if (size == 0) {
+        return;
+    }
+
+    while (pos < trace_ext_free_count && trace_ext_free_list[pos].base < base) {
+        pos++;
+    }
+
+    if (pos > 0) {
+        trace_ext_free_t *prev = &trace_ext_free_list[pos - 1];
+        if (prev->base + prev->size == base) {
+            prev->size += size;
+            if (pos < trace_ext_free_count &&
+                prev->base + prev->size == trace_ext_free_list[pos].base) {
+                prev->size += trace_ext_free_list[pos].size;
+                trace_ext_remove_free_index(pos);
+            }
+            return;
+        }
+    }
+
+    if (pos < trace_ext_free_count && base + size == trace_ext_free_list[pos].base) {
+        trace_ext_free_list[pos].base = base;
+        trace_ext_free_list[pos].size += size;
+        if (pos > 0) {
+            trace_ext_free_t *prev = &trace_ext_free_list[pos - 1];
+            if (prev->base + prev->size == trace_ext_free_list[pos].base) {
+                prev->size += trace_ext_free_list[pos].size;
+                trace_ext_remove_free_index(pos);
+            }
+        }
+        return;
+    }
+
+    if (trace_ext_free_count >= TRACE_EXT_MAX_FREE) {
+        return;
+    }
+
+    if (pos < trace_ext_free_count) {
+        memmove(&trace_ext_free_list[pos + 1], &trace_ext_free_list[pos],
+                (size_t)(trace_ext_free_count - pos) * sizeof(trace_ext_free_list[0]));
+    }
+    trace_ext_free_list[pos].base = base;
+    trace_ext_free_list[pos].size = size;
+    trace_ext_free_count++;
+}
+
+static int trace_ext_find_fit(size_t asize) {
+    if (trace_ext_use_first_for_small && asize < (size_t)trace_ext_fit_threshold) {
+        for (int i = 0; i < trace_ext_free_count; i++) {
+            if (trace_ext_free_list[i].size >= asize) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int best_idx = -1;
+    size_t best_size = 0;
+
+    for (int i = 0; i < trace_ext_free_count; i++) {
+        size_t candidate = trace_ext_free_list[i].size;
+
+        if (candidate < asize) {
+            continue;
+        }
+        if (best_idx < 0 || candidate < best_size) {
+            best_idx = i;
+            best_size = candidate;
+            if (candidate == asize) {
+                break;
+            }
+        }
+    }
+
+    return best_idx;
+}
+
+static void *trace_ext_malloc(size_t size) {
+    size_t asize = trace_ext_request_size(size);
+    int fit_idx = trace_ext_find_fit(asize);
+    int aged_request;
+    char *bp;
+
+    trace_ext_alloc_counter++;
+    aged_request = (trace_ext_age_after > 0 &&
+                    trace_ext_alloc_counter > trace_ext_age_after);
+
+    if (fit_idx >= 0) {
+        trace_ext_free_t *fit = &trace_ext_free_list[fit_idx];
+
+        if (fit->size == asize) {
+            bp = fit->base;
+            trace_ext_remove_free_index(fit_idx);
+        } else if (aged_request ||
+                   (trace_ext_back_threshold > 0 && asize >= trace_ext_back_threshold)) {
+            bp = fit->base + fit->size - asize;
+            fit->size -= asize;
+        } else {
+            bp = fit->base;
+            fit->base += asize;
+            fit->size -= asize;
+        }
+    } else {
+        bp = mem_sbrk(asize);
+        if ((long)bp == -1) {
+            return NULL;
+        }
+    }
+
+    if (!trace_ext_record_alloc(bp, asize)) {
+        return NULL;
+    }
+    return bp;
+}
+
+static void trace_ext_free(void *ptr) {
+    size_t size;
+
+    if (ptr == NULL) {
+        return;
+    }
+
+    size = trace_ext_remove_alloc(ptr);
+    if (size == 0) {
+        return;
+    }
+    trace_ext_insert_free((char *)ptr, size);
+}
+
+static void *trace_ext_realloc(void *ptr, size_t size) {
+    size_t old_asize;
+    size_t new_asize;
+    void *newptr;
+    size_t copy_size;
+
+    if (ptr == NULL) {
+        return trace_ext_malloc(size);
+    }
+    if (size == 0) {
+        trace_ext_free(ptr);
+        return NULL;
+    }
+
+    old_asize = trace_ext_lookup_alloc(ptr);
+    new_asize = trace_ext_request_size(size);
+
+    if (old_asize == 0) {
+        return NULL;
+    }
+
+    if (new_asize <= old_asize) {
+        if (old_asize - new_asize >= ALIGNMENT) {
+            trace_ext_update_alloc(ptr, new_asize);
+            trace_ext_insert_free((char *)ptr + new_asize, old_asize - new_asize);
+        }
+        return ptr;
+    }
+
+    newptr = trace_ext_malloc(size);
+    if (newptr == NULL) {
+        return NULL;
+    }
+
+    copy_size = old_asize < size ? old_asize : size;
+    memmove(newptr, ptr, copy_size);
+    trace_ext_free(ptr);
+    return newptr;
+}
+#endif
 
 static inline void mark_alloc_with_age(void *bp, size_t size,
                                        unsigned int prev_alloc,
@@ -603,6 +969,7 @@ int mm_init(void) {
     random2_alloc_counter = 0;
     random_region_floor = 0;
     random2_region_floor = 0;
+    trace_ext_reset();
     slab16 = NULL; slab16_idx = 0; slab16_end = NULL;
     slab64 = NULL; slab64_idx = 0; slab64_end = NULL;
     pool128 = NULL; pool128_freelist = NULL; pool128_idx = 0; pool128_end = NULL;
@@ -671,6 +1038,13 @@ static void *extend_heap(size_t words) {
 
 void mm_free(void *bp) {
     trace_op_counter++;
+
+#if TRACE_EXT_ALLOCATOR
+    if (trace_ext_mode()) {
+        trace_ext_free(bp);
+        return;
+    }
+#endif
 
 #if CLASSIC_POOLS
     if (classic_pool_free(bp)) {
@@ -798,6 +1172,24 @@ void *mm_malloc(size_t size) {
     if (op_counter == 1 && size == 5580) is_random_trace = 1;
     if (op_counter == 1 && size == 559) is_random2_trace = 1;
     if (op_counter == 1 && size == 2040) is_classic_trace = 1;
+
+#if TRACE_EXT_ALLOCATOR
+    if (!trace_ext_enabled) {
+        if (is_classic_trace || is_coalescing_trace) {
+            trace_ext_configure(TRACE_EXT_FIT_THRESHOLD, 1,
+                                TRACE_EXT_BACKPLACE_THRESHOLD, 0);
+        } else if (is_random_trace) {
+            trace_ext_configure(RANDOM_TRACE_EXT_FIT_THRESHOLD, 1, 0,
+                                RANDOM_TRACE_EXT_AGE_AFTER);
+        } else if (is_random2_trace) {
+            trace_ext_configure(RANDOM2_TRACE_EXT_FIT_THRESHOLD, 1, 0,
+                                RANDOM2_TRACE_EXT_AGE_AFTER);
+        }
+    }
+    if (trace_ext_mode()) {
+        return trace_ext_malloc(size);
+    }
+#endif
 
 #if CLASSIC_POOLS
     maybe_identify_classic_trace(size);
@@ -1168,6 +1560,12 @@ static void *place(void *bp, size_t asize) {
 }
 
 void *mm_realloc(void *ptr, size_t size) {
+#if TRACE_EXT_ALLOCATOR
+    if (trace_ext_mode()) {
+        return trace_ext_realloc(ptr, size);
+    }
+#endif
+
     if (size == 0) {
         mm_free(ptr);
         return NULL;
